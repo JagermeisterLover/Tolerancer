@@ -7,7 +7,7 @@ from datetime import datetime
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QTabWidget, QFileDialog, QTableWidget, QTableWidgetItem,
-    QLabel, QSplitter, QSpinBox, QHeaderView, QSizePolicy, QToolBar,
+    QLabel, QSplitter, QSpinBox, QComboBox, QHeaderView, QSizePolicy, QToolBar,
     QStatusBar, QAbstractItemView, QMessageBox
 )
 from PyQt5.QtCore import Qt, QSize
@@ -443,6 +443,26 @@ def make_table(headers):
     return t
 
 
+def _fmt_float(val):
+    """Format a float without unnecessary scientific notation.
+    Percentages/scores (0.01–9999): plain decimal.
+    Small contributions/changes/wavelengths: scientific.
+    """
+    if val != val:  # NaN
+        return "—"
+    abs_v = abs(val)
+    if abs_v == 0.0:
+        return "0"
+    if abs_v >= 0.01 and abs_v < 10000:
+        if abs_v >= 100:
+            return f"{val:.2f}"
+        elif abs_v >= 10:
+            return f"{val:.3f}"
+        else:
+            return f"{val:.4f}"
+    return f"{val:.4e}"
+
+
 def fill_table(table, rows, highlight_top=3):
     table.setSortingEnabled(False)
     table.setRowCount(len(rows))
@@ -451,7 +471,7 @@ def fill_table(table, rows, highlight_top=3):
             item = QTableWidgetItem()
             if isinstance(val, float):
                 item.setData(Qt.DisplayRole, val)
-                item.setText(f"{val:.6e}")
+                item.setText(_fmt_float(val))
                 item.setTextAlignment(Qt.AlignVCenter | Qt.AlignRight)
             else:
                 item.setText(str(val))
@@ -1026,6 +1046,579 @@ class FileTab(QWidget):
                   self._all_chart, self._summary_chart, self._group_charts)
 
 
+
+# ── CompareTab ────────────────────────────────────────────────────────────────
+
+def _val_match(va, vb, rel_tol=1e-4):
+    """True if two float values are within rel_tol of each other (or both zero)."""
+    if va == 0.0 and vb == 0.0:
+        return True
+    ref = max(abs(va), abs(vb))
+    return ref == 0 or abs(va - vb) / ref <= rel_tol
+
+
+def _build_compare_data(data_a, data_b, label_a, label_b):
+    """Merge two datasets by (operand, surface) key.
+    Returns (rows, mismatches) where:
+      rows      — list of dicts per operand
+      mismatches — list of (operand, surface, min_a, max_a, min_b, max_b) for value conflicts
+    """
+    total_a = sum(op["contribution"] for op in data_a["operands"]) or 1.0
+    total_b = sum(op["contribution"] for op in data_b["operands"]) or 1.0
+
+    map_a = {(op["operand"], op["surface"]): op for op in data_a["operands"]}
+    map_b = {(op["operand"], op["surface"]): op for op in data_b["operands"]}
+
+    sorted_a = sorted(data_a["operands"], key=lambda x: -x["contribution"])
+    sorted_b = sorted(data_b["operands"], key=lambda x: -x["contribution"])
+    rank_a = {(op["operand"], op["surface"]): i+1 for i, op in enumerate(sorted_a)}
+    rank_b = {(op["operand"], op["surface"]): i+1 for i, op in enumerate(sorted_b)}
+
+    all_keys = set(map_a.keys()) | set(map_b.keys())
+    rows = []
+    mismatches = []
+    contrib_max_a = max((op["contribution"] for op in data_a["operands"]), default=1) or 1
+    contrib_max_b = max((op["contribution"] for op in data_b["operands"]), default=1) or 1
+
+    for key in sorted(all_keys):
+        operand, surface = key
+        op_a = map_a.get(key)
+        op_b = map_b.get(key)
+
+        ca = op_a["contribution"] if op_a else 0.0
+        cb = op_b["contribution"] if op_b else 0.0
+
+        # operand tolerance bounds (renamed to avoid shadowing contrib_max_a/b)
+        tol_min_a = op_a["min_val"] if op_a else None
+        tol_max_a = op_a["max_val"] if op_a else None
+        tol_min_b = op_b["min_val"] if op_b else None
+        tol_max_b = op_b["max_val"] if op_b else None
+
+        # Check for value mismatch (only when both files have the operand)
+        value_ok = True
+        if op_a and op_b:
+            if not (_val_match(tol_min_a, tol_min_b) and _val_match(tol_max_a, tol_max_b)):
+                value_ok = False
+                mismatches.append((operand, surface, tol_min_a, tol_max_a, tol_min_b, tol_max_b))
+
+        # Display value: use A if available, else B
+        disp_min = tol_min_a if tol_min_a is not None else tol_min_b
+        disp_max = tol_max_a if tol_max_a is not None else tol_max_b
+
+        pct_a = ca / total_a * 100
+        pct_b = cb / total_b * 100
+        norm_a = ca / contrib_max_a
+        norm_b = cb / contrib_max_b
+        combined = (norm_a * norm_b) ** 0.5
+
+        rows.append({
+            "operand": operand, "surface": surface,
+            "min_val": disp_min, "max_val": disp_max,
+            "value_ok": value_ok,
+            "only_in": None if (op_a and op_b) else ("a" if op_a else "b"),
+            "contrib_a": ca, "contrib_b": cb,
+            "pct_a": pct_a, "pct_b": pct_b,
+            "norm_a": norm_a, "norm_b": norm_b,
+            "rank_a": rank_a.get(key, 9999),
+            "rank_b": rank_b.get(key, 9999),
+            "combined": combined,
+            "label": f"{operand} s{surface}",
+        })
+    return rows, mismatches
+
+
+class CompareChart(FigureCanvas):
+    """Grouped horizontal bar chart for two criteria."""
+    def __init__(self, parent=None):
+        self.fig = Figure(facecolor=CHART_BG)
+        super().__init__(self.fig)
+        self.setParent(parent)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+    def plot_compare(self, rows, label_a, label_b, sort_by="combined", top_n=20):
+        self.fig.clf()
+        ax = self.fig.add_subplot(111)
+        ax.set_facecolor(CHART_BG)
+        self.fig.patch.set_facecolor(CHART_BG)
+
+        if not rows:
+            ax.text(0.5, 0.5, "No data", ha="center", va="center", color=CHART_DIM)
+            self.draw(); return
+
+        # Sort and slice
+        key_fn = {
+            "combined": lambda r: -r["combined"],
+            "a":        lambda r: -r["norm_a"],
+            "b":        lambda r: -r["norm_b"],
+        }.get(sort_by, lambda r: -r["combined"])
+        top = sorted(rows, key=key_fn)[:top_n]
+        top = list(reversed(top))  # bottom-to-top for barh
+
+        labels  = [r["label"] for r in top]
+        vals_a  = [r["norm_a"] * 100 for r in top]
+        vals_b  = [r["norm_b"] * 100 for r in top]
+        n = len(top)
+        y = np.arange(n)
+        bar_h = 0.40
+
+        COLOR_A = C_ACCENT   # blue
+        COLOR_B = C_ACCENT2  # green
+
+        bars_a = ax.barh(y + bar_h/2, vals_a, height=bar_h,
+                         color=COLOR_A, alpha=0.88, edgecolor="white", linewidth=0.4,
+                         label=label_a)
+        bars_b = ax.barh(y - bar_h/2, vals_b, height=bar_h,
+                         color=COLOR_B, alpha=0.88, edgecolor="white", linewidth=0.4,
+                         label=label_b)
+
+        max_v = max(max(vals_a, default=0), max(vals_b, default=0)) or 1
+        for bar, val in zip(bars_a, vals_a):
+            if val > max_v * 0.15:
+                ax.text(val * 0.97, bar.get_y() + bar.get_height()/2,
+                        f"{val:.1f}%", va="center", ha="right",
+                        color="white", fontsize=8, fontweight="bold",
+                        fontfamily="monospace")
+        for bar, val in zip(bars_b, vals_b):
+            if val > max_v * 0.15:
+                ax.text(val * 0.97, bar.get_y() + bar.get_height()/2,
+                        f"{val:.1f}%", va="center", ha="right",
+                        color="white", fontsize=8, fontweight="bold",
+                        fontfamily="monospace")
+
+        ax.set_yticks(y)
+        ax.set_yticklabels(labels, color=CHART_TEXT, fontsize=8.5)
+        ax.set_xlabel("Normalised Contribution (%)", color=CHART_DIM, fontsize=9)
+        ax.set_title(f"{label_a}  vs  {label_b}",
+                     color=CHART_TEXT, fontsize=10, fontweight="bold", pad=8)
+        ax.set_xlim(0, max_v * 1.08)
+        # Give each operand pair enough vertical space — 1 slot = 2 bars + gap
+        ax.set_ylim(-0.8, n - 0.2)
+        ax.tick_params(colors=CHART_DIM, labelsize=8)
+        for sp in ax.spines.values():
+            sp.set_edgecolor(CHART_GRID)
+        ax.grid(axis="x", color=CHART_GRID, linewidth=0.5)
+        # Legend outside plot area at bottom-right
+        ax.legend(frameon=False, labelcolor=CHART_TEXT, fontsize=8,
+                  loc="lower right")
+        try:
+            self.fig.tight_layout()
+        except Exception:
+            pass
+        self.draw()
+
+    def plot_combined_score(self, rows, label_a, label_b, title="Combined Score",
+                            sort_by="combined", top_n=20):
+        """Single bar per operand showing geometric-mean combined score."""
+        self.fig.clf()
+        ax = self.fig.add_subplot(111)
+        ax.set_facecolor(CHART_BG)
+        self.fig.patch.set_facecolor(CHART_BG)
+        if not rows:
+            ax.text(0.5, 0.5, "No data", ha="center", va="center", color=CHART_DIM)
+            self.draw(); return
+
+        key_fn = {"combined": lambda r: -r["combined"],
+                  "a": lambda r: -r["norm_a"],
+                  "b": lambda r: -r["norm_b"]}.get(sort_by, lambda r: -r["combined"])
+        top = list(reversed(sorted(rows, key=key_fn)[:top_n]))
+
+        labels = [r["label"] for r in top]
+        scores = [r["combined"] * 100 for r in top]
+        clrs   = [TYPE_COLORS.get(r["operand"], DEFAULT_COLOR) for r in top]
+        n = len(top)
+        y = np.arange(n)
+
+        ax.barh(y, scores, color=clrs, height=0.55, edgecolor="white", linewidth=0.4)
+        max_v = max(scores) if scores else 1
+        for i, val in enumerate(scores):
+            if val > max_v * 0.25:
+                ax.text(val * 0.97, i, f"{val:.1f}%", va="center", ha="right",
+                        color="white", fontsize=8, fontweight="bold",
+                        fontfamily="monospace")
+            else:
+                ax.text(val + max_v * 0.005, i, f"{val:.1f}%", va="center", ha="left",
+                        color=CHART_TEXT, fontsize=8, fontfamily="monospace")
+        ax.set_yticks(y)
+        ax.set_yticklabels(labels, color=CHART_TEXT, fontsize=8.5)
+        ax.set_xlabel("Combined Score (geom. mean of norm. contributions, %)",
+                      color=CHART_DIM, fontsize=9)
+        ax.set_title(title, color=CHART_TEXT, fontsize=10, fontweight="bold", pad=8)
+        ax.set_xlim(0, max_v * 1.08)
+        ax.set_ylim(-0.7, n - 0.3)
+        ax.tick_params(colors=CHART_DIM, labelsize=8)
+        for sp in ax.spines.values():
+            sp.set_edgecolor(CHART_GRID)
+        ax.grid(axis="x", color=CHART_GRID, linewidth=0.5)
+        try:
+            self.fig.tight_layout()
+        except Exception:
+            pass
+        self.draw()
+
+
+class CompareResultTab(QWidget):
+    """A result tab produced by pressing Compare.
+    Inner tabs mirror FileTab structure: All, Summary, per-type groups.
+    Each group shows A vs B side-by-side AND a combined score bar.
+    """
+    def __init__(self, rows, data_a, data_b, label_a, label_b,
+                 sort_key="combined", top_n=20, parent=None):
+        super().__init__(parent)
+        self._rows    = rows
+        self._label_a = label_a
+        self._label_b = label_b
+        self._sort_key = sort_key
+        self._top_n   = top_n
+        self._crit_a  = data_a.get("criterion", "")
+        self._crit_b  = data_b.get("criterion", "")
+        self._n_a     = len(data_a["operands"])
+        self._n_b     = len(data_b["operands"])
+        self._build_ui()
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+    def _filter_rows(self, codes=None):
+        """Return rows filtered to operand codes (None = all)."""
+        if codes is None:
+            return self._rows
+        return [r for r in self._rows if r["operand"] in codes]
+
+    def _make_table(self):
+        return make_table(["#", "Operand", "Surf", "Description",
+                           "Min Val", "Max Val",
+                           "Contrib A", "% A (norm)",
+                           "Contrib B", "% B (norm)",
+                           "Rank A", "Rank B", "Combined Score"])
+
+    def _fill(self, tbl, rows, sort_key, top_n):
+        key_fn = {"combined": lambda r: -r["combined"],
+                  "a":        lambda r: -r["norm_a"],
+                  "b":        lambda r: -r["norm_b"]}.get(sort_key, lambda r: -r["combined"])
+        top = sorted(rows, key=key_fn)[:top_n]
+        tbl.setSortingEnabled(False)
+        tbl.setRowCount(len(top))
+        for i, r in enumerate(top):
+            vals = (i+1, r["operand"], r["surface"],
+                    OPERAND_DESC.get(r["operand"], ""),
+                    r["min_val"] if r["min_val"] is not None else float("nan"),
+                    r["max_val"] if r["max_val"] is not None else float("nan"),
+                    r["contrib_a"], r["pct_a"],
+                    r["contrib_b"], r["pct_b"],
+                    r["rank_a"], r["rank_b"],
+                    r["combined"] * 100)
+            for c, val in enumerate(vals):
+                item = QTableWidgetItem()
+                if isinstance(val, float):
+                    item.setData(Qt.DisplayRole, val)
+                    item.setText(_fmt_float(val))
+                    item.setTextAlignment(Qt.AlignVCenter | Qt.AlignRight)
+                else:
+                    item.setText(str(val))
+                    item.setTextAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+                # Highlight last col (combined) for top 3
+                if i < 3 and c == len(vals) - 1:
+                    item.setForeground(QBrush(QColor(C_WARN)))
+                # Flag value mismatch: orange background on min/max val cols
+                if not r.get("value_ok", True) and c in (4, 5):
+                    item.setBackground(QBrush(QColor("#fff3cd")))
+                    item.setForeground(QBrush(QColor("#92400e")))
+                    item.setToolTip("⚠ Tolerance value differs between the two files")
+                # Flag operand only in one file
+                if r.get("only_in") and c in (4, 5):
+                    item.setBackground(QBrush(QColor("#fce8e8")))
+                    item.setForeground(QBrush(QColor(C_ERR)))
+                    item.setToolTip(f"Operand only present in file {'A' if r['only_in']=='a' else 'B'}")
+                tbl.setItem(i, c, item)
+        tbl.setSortingEnabled(True)
+
+    def _make_split_tab(self, rows_subset, tab_title, group_label=None):
+        """Create one inner-tab widget with table | A-vs-B chart | combined chart."""
+        w = QWidget()
+        vl = QVBoxLayout(w)
+        vl.setContentsMargins(4, 4, 4, 4)
+        vl.setSpacing(4)
+
+        # controls
+        ctl = QHBoxLayout()
+        ctl.addWidget(QLabel("Sort by:"))
+        combo_sort = QComboBox()
+        combo_sort.addItems(["Combined", "File A", "File B"])
+        combo_sort.setCurrentIndex(["combined","a","b"].index(self._sort_key))
+        combo_sort.setFixedWidth(140)
+        ctl.addWidget(combo_sort)
+        ctl.addWidget(QLabel("  Top N:"))
+        spin = QSpinBox(); spin.setRange(1, 500); spin.setValue(self._top_n)
+        spin.setFixedWidth(60)
+        ctl.addWidget(spin)
+        ctl.addStretch()
+        vl.addLayout(ctl)
+
+        # horizontal splitter: table | charts (vertical: side-by-side top, combined bottom)
+        h_split = QSplitter(Qt.Horizontal)
+
+        tbl = self._make_table()
+        h_split.addWidget(tbl)
+
+        # right side: two charts stacked
+        right = QWidget()
+        rv = QVBoxLayout(right)
+        rv.setContentsMargins(0, 0, 0, 0)
+        rv.setSpacing(2)
+
+        chart_ab  = CompareChart()   # A vs B grouped bars
+        chart_comb = CompareChart()  # combined score single bars
+        rv.addWidget(chart_ab,   stretch=3)
+        rv.addWidget(chart_comb, stretch=2)
+        h_split.addWidget(right)
+        h_split.setSizes([480, 680])
+        vl.addWidget(h_split)
+
+        title_ab   = f"{self._label_a}  vs  {self._label_b}"
+        if group_label:
+            title_ab = f"{group_label} — {title_ab}"
+        title_comb = f"{group_label or 'All'} — Combined Score"
+
+        def refresh():
+            sk = ["combined","a","b"][combo_sort.currentIndex()]
+            n  = spin.value()
+            rs = self._filter_rows(None) if rows_subset is None else rows_subset
+            self._fill(tbl, rs, sk, n)
+            chart_ab.plot_compare(rs, self._label_a, self._label_b,
+                                  sort_by=sk, top_n=n)
+            chart_comb.plot_combined_score(rs, self._label_a, self._label_b,
+                                           title=title_comb, sort_by=sk, top_n=n)
+
+        combo_sort.currentIndexChanged.connect(refresh)
+        spin.valueChanged.connect(refresh)
+        refresh()
+        return w
+
+    def _make_summary_tab(self):
+        """Summary by operand type — totals for A, B, combined."""
+        w = QWidget()
+        vl = QVBoxLayout(w)
+        vl.setContentsMargins(4, 4, 4, 4)
+
+        # Build per-type aggregate
+        from collections import defaultdict
+        type_a = defaultdict(float); type_b = defaultdict(float)
+        type_comb = defaultdict(float); type_cnt = defaultdict(int)
+        for r in self._rows:
+            op = r["operand"]
+            type_a[op]    += r["contrib_a"]
+            type_b[op]    += r["contrib_b"]
+            type_comb[op] += r["combined"]
+            type_cnt[op]  += 1
+
+        codes = sorted(type_comb.keys(), key=lambda c: -type_comb[c])
+
+        # Count mismatches per type
+        type_mm = defaultdict(int)
+        for r in self._rows:
+            if not r.get("value_ok", True):
+                type_mm[r["operand"]] += 1
+
+        tbl = make_table(["Operand", "Description", "Count",
+                          "Val Mismatches",
+                          "Total Contrib A", "Total Contrib B", "Combined Score"])
+        tbl_rows = [(c, OPERAND_DESC.get(c,""), type_cnt[c],
+                     type_mm.get(c, 0),
+                     type_a[c], type_b[c], type_comb[c] * 100)
+                    for c in codes]
+        fill_table(tbl, tbl_rows, highlight_top=3)
+
+        # pie showing combined score share by type
+        pie = ChartCanvas()
+        pie_labels = codes[:12]
+        pie_vals   = [type_comb[c] for c in pie_labels]
+        pie_colors = [TYPE_COLORS.get(c, DEFAULT_COLOR) for c in pie_labels]
+        pie.plot_pie(pie_labels, pie_vals, pie_colors, "Combined Score by Operand Type")
+
+        h_split = QSplitter(Qt.Horizontal)
+        h_split.addWidget(tbl)
+        h_split.addWidget(pie)
+        h_split.setSizes([420, 740])
+        vl.addWidget(h_split)
+        return w
+
+    # ── build UI ─────────────────────────────────────────────────────────────
+    def _build_ui(self):
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(0)
+
+        # info bar
+        info = QLabel(
+            f"  A: <b style='color:{C_ACCENT}'>{self._label_a}</b>"
+            f"  [{self._crit_a}]  ·  Operands: {self._n_a}"
+            f"   &nbsp;&nbsp;|&nbsp;&nbsp;  "
+            f"B: <b style='color:{C_ACCENT2}'>{self._label_b}</b>"
+            f"  [{self._crit_b}]  ·  Operands: {self._n_b}"
+        )
+        info.setTextFormat(Qt.RichText)
+        info.setStyleSheet(
+            f"background:{C_SURFACE}; padding:6px 10px;"
+            f" border-bottom:1px solid {C_BORDER}; font-size:12px;")
+        info.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        vl.addWidget(info)
+
+        # inner tab widget
+        inner = QTabWidget()
+        inner.setUsesScrollButtons(True)
+        inner.setElideMode(Qt.ElideNone)
+        inner.tabBar().setExpanding(False)
+        inner.setStyleSheet(f"""
+            QTabWidget::pane {{ border: 1px solid {C_BORDER}; background: {C_SURFACE}; }}
+            QTabBar {{ background: {C_BG}; }}
+            QTabBar::tab {{
+                background: {C_BG}; color: {C_TEXT_DIM};
+                border: 1px solid {C_BORDER}; border-bottom: none;
+                padding: 4px 10px; font-size: 11px; min-width: 0px; margin-right: 1px;
+            }}
+            QTabBar::tab:selected {{
+                background: {C_SURFACE}; color: {C_ACCENT};
+                border-bottom: 2px solid {C_ACCENT}; font-weight: bold;
+            }}
+            QTabBar::tab:hover {{ color: {C_TEXT}; background: {C_ALT_ROW}; }}
+            QTabBar::scroller {{ width: 20px; }}
+        """)
+        vl.addWidget(inner)
+
+        # All tab
+        all_tab = self._make_split_tab(None, "All")
+        inner.addTab(all_tab, "All")
+        inner.setTabToolTip(0, "All operands ranked by combined score")
+
+        # Summary tab
+        sum_tab = self._make_summary_tab()
+        inner.addTab(sum_tab, "Summary")
+        inner.setTabToolTip(1, "Contribution totalled per operand type")
+
+        # Per-type tabs — only types present in rows
+        present_types = set(r["operand"] for r in self._rows)
+        for group_name, codes in TYPE_GROUPS.items():
+            codes_set = set(codes)
+            subset = [r for r in self._rows if r["operand"] in codes_set]
+            if not subset:
+                continue
+            gt = self._make_split_tab(subset, group_name, group_label=group_name)
+            idx = inner.addTab(gt, group_name)
+            inner.setTabToolTip(idx, GROUP_TOOLTIP.get(group_name, group_name))
+
+
+class CompareTab(QWidget):
+    """Control panel tab for launching comparisons. Each compare spawns a result tab."""
+    def __init__(self, files_dict, file_tabs_widget, parent=None):
+        super().__init__(parent)
+        self._files = files_dict
+        self._file_tabs = file_tabs_widget
+        self._build_ui()
+
+    def _build_ui(self):
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(6, 6, 6, 6)
+
+        # ── selector bar ──
+        sel = QHBoxLayout()
+        sel.addWidget(QLabel("File A:"))
+        self.combo_a = QComboBox(); self.combo_a.setMinimumWidth(260)
+        sel.addWidget(self.combo_a)
+
+        sel.addWidget(QLabel("  File B:"))
+        self.combo_b = QComboBox(); self.combo_b.setMinimumWidth(260)
+        sel.addWidget(self.combo_b)
+
+        sel.addWidget(QLabel("  Sort by:"))
+        self.combo_sort = QComboBox()
+        self.combo_sort.addItems(["Combined (geom. mean)", "File A contrib", "File B contrib"])
+        self.combo_sort.setFixedWidth(200)
+        sel.addWidget(self.combo_sort)
+
+        sel.addWidget(QLabel("  Top N:"))
+        self.spin = QSpinBox(); self.spin.setRange(1, 500); self.spin.setValue(20)
+        self.spin.setFixedWidth(65)
+        sel.addWidget(self.spin)
+
+        btn = QPushButton("⟳  Compare")
+        btn.clicked.connect(self.run_compare)
+        sel.addWidget(btn)
+        sel.addStretch()
+        vl.addLayout(sel)
+
+        hint = QLabel(
+            "Select two files and click  ⟳ Compare  to create a new result tab.")
+        hint.setStyleSheet(
+            f"color:{C_TEXT_DIM}; font-size:12px; padding:10px;")
+        vl.addWidget(hint)
+
+        self.refresh_combos()
+
+    def refresh_combos(self):
+        """Reload file lists from the live _files dict."""
+        paths = list(self._files.keys())
+        for combo in (self.combo_a, self.combo_b):
+            cur = combo.currentText()
+            combo.blockSignals(True)
+            combo.clear()
+            for p in paths:
+                combo.addItem(os.path.basename(p), p)
+            # restore selection if still present
+            idx = combo.findText(cur)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+            combo.blockSignals(False)
+        # default: A=0, B=1
+        if self.combo_a.count() >= 1:
+            self.combo_a.setCurrentIndex(0)
+        if self.combo_b.count() >= 2:
+            self.combo_b.setCurrentIndex(1)
+
+    def run_compare(self):
+        path_a = self.combo_a.currentData()
+        path_b = self.combo_b.currentData()
+        if not path_a or not path_b:
+            return
+        if path_a == path_b:
+            QMessageBox.warning(self, "Same File", "Select two different files.")
+            return
+
+        data_a = self._files.get(path_a)
+        data_b = self._files.get(path_b)
+        if not data_a or not data_b:
+            return
+
+        label_a = os.path.basename(path_a)
+        label_b = os.path.basename(path_b)
+        si = self.combo_sort.currentIndex()
+        sort_key = ["combined", "a", "b"][si]
+        top_n = self.spin.value()
+
+        rows, mismatches = _build_compare_data(data_a, data_b, label_a, label_b)
+
+        # Show mismatch warning if needed
+        if mismatches:
+            lines = [f"  {op} s{surf}:  A=[{mn_a:.4e}, {mx_a:.4e}]  B=[{mn_b:.4e}, {mx_b:.4e}]"
+                     for op, surf, mn_a, mx_a, mn_b, mx_b in mismatches[:20]]
+            suffix = f"\n  … and {len(mismatches)-20} more" if len(mismatches) > 20 else ""
+            QMessageBox.warning(self, "Tolerance Value Mismatch",
+                f"{len(mismatches)} operand(s) have different tolerance values in the two files:\n\n"
+                + "\n".join(lines) + suffix +
+                "\n\nThese are highlighted in the result table.")
+
+        # Create a new result tab and insert it into the parent file_tabs
+        result = CompareResultTab(rows, data_a, data_b, label_a, label_b,
+                                  sort_key=sort_key, top_n=top_n)
+        short_a = label_a[:14] + "…" if len(label_a) > 14 else label_a
+        short_b = label_b[:14] + "…" if len(label_b) > 14 else label_b
+        tab_label = f"⇄ {short_a} vs {short_b}"
+        if self._file_tabs is not None:
+            idx = self._file_tabs.addTab(result, tab_label)
+            self._file_tabs.setCurrentIndex(idx)
+
+    def on_files_changed(self):
+        """Called by MainWindow when files are loaded/closed."""
+        self.refresh_combos()
+
+
 # ── MainWindow ────────────────────────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
@@ -1035,6 +1628,7 @@ class MainWindow(QMainWindow):
         self.resize(1440, 880)
         self.setStyleSheet(STYLESHEET)
         self._files = {}
+        self._compare_tab = None
         self._build_ui()
 
     def _build_ui(self):
@@ -1054,6 +1648,10 @@ class MainWindow(QMainWindow):
         btn_pdf = QPushButton("⬇  Save Report PDF")
         btn_pdf.clicked.connect(self.save_pdf)
         tb.addWidget(btn_pdf)
+
+        btn_compare = QPushButton("⇄  Compare Files")
+        btn_compare.clicked.connect(self._open_compare_tab)
+        tb.addWidget(btn_compare)
 
         self.file_tabs = QTabWidget()
         self.file_tabs.setTabsClosable(True)
@@ -1126,6 +1724,8 @@ class MainWindow(QMainWindow):
             self.status.showMessage("No operands found."); return
 
         self._files[path] = data
+        if self._compare_tab is not None:
+            self._compare_tab.on_files_changed()
         if self.file_tabs.count() == 1 and self.file_tabs.tabText(0) == "Welcome":
             self.file_tabs.removeTab(0)
 
@@ -1162,6 +1762,22 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "PDF Error", str(e))
             self.status.showMessage("PDF export failed.")
 
+    def _open_compare_tab(self):
+        if len(self._files) < 2:
+            QMessageBox.information(self, "Need 2 files",
+                "Load at least two tolerance files before comparing.")
+            return
+        # Reuse existing compare tab if present
+        if self._compare_tab is not None:
+            for i in range(self.file_tabs.count()):
+                if self.file_tabs.widget(i) is self._compare_tab:
+                    self._compare_tab.refresh_combos()
+                    self.file_tabs.setCurrentIndex(i)
+                    return
+        self._compare_tab = CompareTab(self._files, self.file_tabs)
+        idx = self.file_tabs.addTab(self._compare_tab, "⇄ Compare")
+        self.file_tabs.setCurrentIndex(idx)
+
     def close_current(self):
         idx = self.file_tabs.currentIndex()
         if idx >= 0:
@@ -1172,6 +1788,8 @@ class MainWindow(QMainWindow):
         if tip in self._files:
             del self._files[tip]
         self.file_tabs.removeTab(idx)
+        if self._compare_tab is not None:
+            self._compare_tab.on_files_changed()
         if self.file_tabs.count() == 0:
             self._show_welcome()
             self.status.showMessage("Ready.")
